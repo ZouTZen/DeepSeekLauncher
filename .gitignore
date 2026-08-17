@@ -1,0 +1,14 @@
+# 构建产物(编译生成的 exe / dll)——仅根目录
+/dist/
+/lib/
+
+# installer 的二进制产物(保留 .iss / .isl / setup-deps.ps1 等源码脚本)
+installer/*.exe
+installer/payload/*.exe
+installer/payload/*.dll
+
+# 系统与编辑器
+Thumbs.db
+.DS_Store
+*.log
+*.log.*
