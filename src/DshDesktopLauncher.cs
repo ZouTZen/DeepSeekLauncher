@@ -762,6 +762,11 @@ namespace DshDesktop
         // initializing still lands on the right page.
         private string pendingUrl;
 
+        // True while a navigation was triggered by a top nav button (Platform /
+        // Chat / GitHub are intended external sites); page-internal link clicks
+        // leave this false and get their external targets routed to the browser.
+        private bool navButtonNavigation;
+
         // DeepSeek brand blue for the selected nav button fill.
         private static readonly System.Drawing.Color ActiveColor = System.Drawing.Color.FromArgb(0x6B, 0x87, 0xD9);
 
@@ -845,6 +850,7 @@ namespace DshDesktop
         {
             Button b = (Button)sender;
             string url = (string)b.Tag;
+            navButtonNavigation = true;
             NavigateTo(url);
         }
 
@@ -906,6 +912,7 @@ namespace DshDesktop
                 // same WebView2 (and share its cookies/localStorage, so console
                 // and chat logins persist) instead of opening a browser.
                 webView.CoreWebView2.NewWindowRequested += OnNewWindowRequested;
+                webView.CoreWebView2.NavigationStarting += OnNavigationStarting;
 
                 HighlightNav(pendingUrl);
                 webView.CoreWebView2.Navigate(pendingUrl);
@@ -970,9 +977,14 @@ namespace DshDesktop
 
         private void OnNewWindowRequested(object sender, CoreWebView2NewWindowRequestedEventArgs e)
         {
-            // Route pop-ups back into this window; keep the service alive while
-            // the navigation is handled on the same core.
             e.Handled = true;
+            // External pop-ups open in the system browser; internal ones stay in
+            // this window (the harness opens its own UI in pop-ups).
+            if (IsExternalUrl(e.Uri))
+            {
+                try { Process.Start(e.Uri); } catch { }
+                return;
+            }
             try
             {
                 webView.CoreWebView2.Navigate(e.Uri);
@@ -982,6 +994,31 @@ namespace DshDesktop
             {
                 // Best effort; the link simply does not open if navigation fails.
             }
+        }
+
+        // Intercept page-internal navigation: a link inside a Harness answer
+        // must not hijack this tab-less, back-less shell. External http(s) URLs
+        // open in the system browser; the Harness's own 127.0.0.1 URLs still
+        // navigate in place.
+        private void OnNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
+        {
+            if (navButtonNavigation)
+            {
+                navButtonNavigation = false;
+                return;
+            }
+            if (IsExternalUrl(e.Uri))
+            {
+                e.Cancel = true;
+                try { Process.Start(e.Uri); } catch { }
+            }
+        }
+
+        private bool IsExternalUrl(string uri)
+        {
+            if (uri.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase)) return false;
+            return uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
