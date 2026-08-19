@@ -751,24 +751,26 @@ namespace DshDesktop
         private readonly int port;
         private readonly int serverPid;
         private readonly string webViewData;
+        private Panel webHost;
+        private WebView2[] views;
+        private bool[] viewLoaded;
+        private string[] pageUrls;
+        private int activeView;
         private WebView2 webView;
-        private RoundedButton harnessButton;
-        private RoundedButton consoleButton;
-        private RoundedButton chatButton;
-        private RoundedButton githubButton;
-        private ContextMenuStrip harnessMenu;
+        private Button harnessButton;
+        private Button consoleButton;
+        private Button chatButton;
+        private Button githubButton;
+        private Button settingsButton;
+        private Panel titleBar;
+        private Panel sidebar;
+        private Panel settingsPage;
+        private ComboBox themeBox;
+        private System.Drawing.Image backgroundLight;
+        private System.Drawing.Image backgroundDark;
 
-        // The URL the user last picked, so a click before WebView2 finishes
-        // initializing still lands on the right page.
-        private string pendingUrl;
-
-        // True while a navigation was triggered by a top nav button (Platform /
-        // Chat / GitHub are intended external sites); page-internal link clicks
-        // leave this false and get their external targets routed to the browser.
-        private bool navButtonNavigation;
-
-        // DeepSeek brand blue for the selected nav button fill.
-        private static readonly System.Drawing.Color ActiveColor = System.Drawing.Color.FromArgb(0x6B, 0x87, 0xD9);
+        // The page index currently highlighted in the sidebar.
+        private int currentIndex = 0;
 
         public MainForm(int port, int serverPid, string webViewData)
         {
@@ -780,20 +782,36 @@ namespace DshDesktop
             StartPosition = FormStartPosition.CenterScreen;
             Width = 1280;
             Height = 860;
+            // 原生应用外观:去掉系统标题栏,由自绘标题栏承担拖动/窗口控制。
+            FormBorderStyle = FormBorderStyle.None;
             FormClosing += OnFormClosing;
 
-            pendingUrl = HarnessUrl();
+            // 载入上次保存的背景图;有背景时设 WebView2 透明环境变量
+            // (在 WebView 环境创建前设置,避免透明背景的白底闪烁)。
+            LoadBackground();
+
+            pageUrls = new string[] { HarnessUrl(), ConsoleUrl, ChatUrl, GitHubUrl };
+            views = new WebView2[4];
+            viewLoaded = new bool[4];
 
             // WinForms docks controls in reverse z-order: the last control
-            // added to Controls claims space first. Add the fill-docked
-            // WebView2 BEFORE the top-docked nav bar, so the bar claims its
-            // strip first and the web view fills only what remains — the
-            // previous order filled the web view over the whole client area
-            // and let the bar overlap the page's top strip.
-            webView = new WebView2 { Dock = DockStyle.Fill };
-            Controls.Add(webView);
-            BuildNavBar();
-            BuildHarnessMenu();
+            // added claims space first. The web host (containing four
+            // independent WebViews) fills first, then the sidebar and title bar
+            // claim their strips, and the settings page overlays the web host.
+            webHost = new Panel { Dock = DockStyle.Fill };
+            Controls.Add(webHost);
+            for (int i = 0; i < views.Length; i++)
+            {
+                views[i] = new WebView2 { Dock = DockStyle.Fill, Visible = false };
+                webHost.Controls.Add(views[i]);
+            }
+            webView = views[0];
+
+            // Dock 顺序 = 后 add 先占位:设置页(Fill)在 webHost 之后、边栏之前
+            // add,使其覆盖 webHost 却不遮住标题栏与侧边栏。
+            BuildSettingsPage();
+            BuildSidebar();
+            BuildTitleBar();
             Load += OnLoad;
         }
 
@@ -802,94 +820,698 @@ namespace DshDesktop
             return "http://127.0.0.1:" + port;
         }
 
+        // ── 背景图持久化 ─────────────────────────────────────────────────
+        // 亮/暗背景图路径存到 %LocalAppData%\DeepSeekHarnessDesktop\,下次启动恢复。
+
+        private static string BackgroundPathFile(bool light)
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeepSeekHarnessDesktop");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, light ? "bg-light.txt" : "bg-dark.txt");
+        }
+
+        private static string ReadBackgroundPath(bool light)
+        {
+            try
+            {
+                string f = BackgroundPathFile(light);
+                if (File.Exists(f))
+                {
+                    string p = File.ReadAllText(f).Trim();
+                    if (p.Length > 0) return p;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static void SaveBackgroundPath(bool light, string path)
+        {
+            try { File.WriteAllText(BackgroundPathFile(light), path); }
+            catch { }
+        }
+
+        private static void ClearBackgroundPath(bool light)
+        {
+            try { File.Delete(BackgroundPathFile(light)); }
+            catch { }
+        }
+
+        private void LoadBackground()
+        {
+            try
+            {
+                string light = ReadBackgroundPath(true);
+                string dark = ReadBackgroundPath(false);
+                if (light != null && File.Exists(light)) backgroundLight = System.Drawing.Image.FromFile(light);
+                if (dark != null && File.Exists(dark)) backgroundDark = System.Drawing.Image.FromFile(dark);
+            }
+            catch { }
+        }
+
         private const string ConsoleUrl = "https://platform.deepseek.com/";
         private const string ChatUrl = "https://chat.deepseek.com/";
         private const string GitHubUrl = "https://github.com/";
 
-        private void BuildNavBar()
+        // ── 应用边框(顶部标题栏 + 左侧边栏) ────────────────────────────
+        // 无系统边框后,顶部标题栏承担应用标题与最小化/最大化/关闭(可拖动、
+        // 双击切换最大化);左侧边栏承担页面切换(Harness/Platform/Chat/GitHub)
+        // 与底部设置。边框颜色跟随系统深浅色,也可在设置里手动指定。
+
+        private const int TitleBarHeight = 40;
+        private const int SidebarWidth = 140;
+        private const int SideButtonHeight = 46;
+
+        private enum ColorMode { FollowSystem, Light, Dark }
+        private ColorMode colorMode = ColorMode.FollowSystem;
+
+        private static bool SystemUsesLightTheme()
         {
-            Panel bar = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(8, 8, 8, 8) };
-
-            harnessButton = MakeNavButton("Harness", HarnessUrl());
-            consoleButton = MakeNavButton("Platform", ConsoleUrl);
-            chatButton = MakeNavButton("Chat", ChatUrl);
-            githubButton = MakeNavButton("GitHub", GitHubUrl);
-
-            // Equal width, equal 12px gap, vertically centered on the bar.
-            int x = 8;
-            harnessButton.Location = new System.Drawing.Point(x, 8);
-            x += harnessButton.Width + 12;
-            consoleButton.Location = new System.Drawing.Point(x, 8);
-            x += consoleButton.Width + 12;
-            chatButton.Location = new System.Drawing.Point(x, 8);
-            x += chatButton.Width + 12;
-            githubButton.Location = new System.Drawing.Point(x, 8);
-
-            bar.Controls.Add(harnessButton);
-            bar.Controls.Add(consoleButton);
-            bar.Controls.Add(chatButton);
-            bar.Controls.Add(githubButton);
-            Controls.Add(bar);
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key = Microsoft.Win32.Registry.CurrentUser
+                    .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = key == null ? null : key.GetValue("AppsUseLightTheme");
+                    if (v is int) return (int)v != 0;
+                }
+            }
+            catch { }
+            return true;
         }
 
-        private RoundedButton MakeNavButton(string label, string url)
+        private bool IsDarkMode()
         {
-            RoundedButton b = new RoundedButton
+            return colorMode == ColorMode.Dark
+                || (colorMode == ColorMode.FollowSystem && !SystemUsesLightTheme());
+        }
+
+        private void BuildTitleBar()
+        {
+            titleBar = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = TitleBarHeight,
+            };
+            titleBar.MouseDown += OnTitleBarMouseDown;
+            titleBar.MouseDoubleClick += OnTitleBarDoubleClick;
+            titleBar.Resize += (s, e) => LayoutTitleBar();
+
+            // 折叠按钮:左键收起/展开左侧边栏
+            Button collapse = MakeWindowButton("\u2630", OnCollapseClick);
+            collapse.Name = "collapse";
+            collapse.Location = new System.Drawing.Point(8, 5);
+            collapse.Width = 34;
+            titleBar.Controls.Add(collapse);
+
+            // 应用标题(与标题栏一样可拖动/双击)
+            Label title = new Label
+            {
+                Text = Launcher.AppTitle,
+                AutoSize = true,
+                BackColor = System.Drawing.Color.Transparent,
+                Font = new System.Drawing.Font("Segoe UI", 10f, System.Drawing.FontStyle.Bold),
+                Location = new System.Drawing.Point(46, 11),
+            };
+            title.MouseDown += OnTitleBarMouseDown;
+            title.MouseDoubleClick += OnTitleBarDoubleClick;
+            titleBar.Controls.Add(title);
+
+            // 窗口控制按钮(最右侧,由 LayoutTitleBar 定位)
+            Button close = MakeWindowButton("\u2715", OnCloseClick);
+            close.Name = "winClose";
+            close.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(0xC4, 0x2B, 0x1C);
+            Button max = MakeWindowButton("\u25A1", OnMaximizeClick);
+            max.Name = "winMax";
+            Button min = MakeWindowButton("\u2014", OnMinimizeClick);
+            min.Name = "winMin";
+            titleBar.Controls.Add(min);
+            titleBar.Controls.Add(max);
+            titleBar.Controls.Add(close);
+
+            Controls.Add(titleBar);
+        }
+
+        private void BuildSidebar()
+        {
+            sidebar = new Panel { Dock = DockStyle.Left, Width = SidebarWidth };
+
+            settingsButton = MakeSettingsButton();
+            settingsButton.Dock = DockStyle.Bottom;
+
+            harnessButton = MakeSideButton("Harness", 0);
+            consoleButton = MakeSideButton("Platform", 1);
+            chatButton = MakeSideButton("Chat", 2);
+            githubButton = MakeSideButton("GitHub", 3);
+
+            // Dock 顺序:后加入的先占位,故先放设置(底部),再依次放导航(顶部往下)。
+            sidebar.Controls.Add(settingsButton);
+            sidebar.Controls.Add(githubButton);
+            sidebar.Controls.Add(chatButton);
+            sidebar.Controls.Add(consoleButton);
+            sidebar.Controls.Add(harnessButton);
+
+            Controls.Add(sidebar);
+        }
+
+        // 侧边栏导航按钮:全宽填充、无圆角、无边框。未选白底黑字,选中蓝底白字。
+        // 左键:切换到对应页面(多实例,保留上次浏览位置);右键:刷新该页。
+        private Button MakeSideButton(string label, int index)
+        {
+            Button b = new Button
             {
                 Text = label,
-                Size = new System.Drawing.Size(96, 32),
+                Dock = DockStyle.Top,
+                Height = SideButtonHeight,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = System.Drawing.Color.White,
+                ForeColor = System.Drawing.Color.Black,
+                Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Bold),
                 Cursor = Cursors.Hand,
-                Tag = url,
-                Font = System.Drawing.SystemFonts.CaptionFont,
+                Tag = index,
+                Margin = new Padding(0),
             };
+            b.FlatAppearance.BorderSize = 1;
+            b.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(0xE8, 0xE8, 0xE8);
+            b.Click += OnNavClick;
+
+            ContextMenuStrip menu = new ContextMenuStrip();
+            ToolStripMenuItem refresh = new ToolStripMenuItem("刷新");
+            refresh.Click += (s, e) => RefreshPage(index);
+            menu.Items.Add(refresh);
+            b.ContextMenuStrip = menu;
+            return b;
+        }
+
+        private Button MakeSettingsButton()
+        {
+            Button b = new Button
+            {
+                Text = "设置",
+                Dock = DockStyle.Top,
+                Height = SideButtonHeight,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = System.Drawing.Color.White,
+                ForeColor = System.Drawing.Color.Black,
+                Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                Tag = 4,
+                Margin = new Padding(0),
+            };
+            b.FlatAppearance.BorderSize = 1;
+            b.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(0xE8, 0xE8, 0xE8);
             b.Click += OnNavClick;
             return b;
         }
 
-        private void OnNavClick(object sender, EventArgs e)
+        // ── 设置页(第 5 个页面,与四个跳转页同级) ─────────────────────
+        // 填满 webHost,含主题(黑/白/跟随系统)与屏幕缩放,无关闭按钮
+        // (通过切到其他页离开)。
+        private void BuildSettingsPage()
         {
-            Button b = (Button)sender;
-            string url = (string)b.Tag;
-            navButtonNavigation = true;
-            NavigateTo(url);
+            settingsPage = new Panel { Dock = DockStyle.Fill, Visible = false };
+
+            Label heading = new Label
+            {
+                Text = "设置",
+                Font = new System.Drawing.Font("Segoe UI", 20f, System.Drawing.FontStyle.Bold),
+                ForeColor = System.Drawing.Color.Black,
+                BackColor = System.Drawing.Color.Transparent,
+                Location = new System.Drawing.Point(40, 36),
+                AutoSize = true,
+            };
+
+            Label themeLabel = new Label
+            {
+                Text = "主题",
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+                ForeColor = System.Drawing.Color.Black,
+                BackColor = System.Drawing.Color.Transparent,
+                Location = new System.Drawing.Point(40, 110),
+                AutoSize = true,
+            };
+            themeBox = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Location = new System.Drawing.Point(140, 106),
+                Width = 200,
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+            };
+            themeBox.Items.AddRange(new object[] { "黑", "白", "跟随系统" });
+            themeBox.SelectedIndex = 2;
+            themeBox.SelectedIndexChanged += (s, e) =>
+            {
+                if (themeBox.SelectedIndex == 0) colorMode = ColorMode.Dark;
+                else if (themeBox.SelectedIndex == 1) colorMode = ColorMode.Light;
+                else colorMode = ColorMode.FollowSystem;
+                ApplyColorScheme();
+            };
+
+            Label zoomLabel = new Label
+            {
+                Text = "屏幕缩放",
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+                ForeColor = System.Drawing.Color.Black,
+                BackColor = System.Drawing.Color.Transparent,
+                Location = new System.Drawing.Point(40, 160),
+                AutoSize = true,
+            };
+            ComboBox zoomBox = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Location = new System.Drawing.Point(140, 156),
+                Width = 200,
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+            };
+            double[] factors = { 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0 };
+            string[] zoomLabels = { "80%", "90%", "100%(跟随系统)", "110%", "125%", "150%", "175%", "200%" };
+            zoomBox.Items.AddRange(zoomLabels);
+            zoomBox.SelectedIndex = 2;
+            zoomBox.SelectedIndexChanged += (s, e) =>
+            {
+                if (zoomBox.SelectedIndex >= 0 && zoomBox.SelectedIndex < factors.Length)
+                    ApplyZoom(factors[zoomBox.SelectedIndex]);
+            };
+
+            // 背景图片:亮色图/暗色图各一张;设置后主题选项失效,系统深浅色决定用哪张。
+            Label bgLabel = new Label
+            {
+                Text = "背景图片(设置后主题失效,跟随系统深浅色选用亮/暗图)",
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+                ForeColor = System.Drawing.Color.Black,
+                BackColor = System.Drawing.Color.Transparent,
+                Location = new System.Drawing.Point(40, 210),
+                AutoSize = true,
+            };
+            Button lightBgButton = new Button
+            {
+                Text = "亮色背景图",
+                Location = new System.Drawing.Point(40, 246),
+                Size = new System.Drawing.Size(150, 34),
+                FlatStyle = FlatStyle.Flat,
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+            };
+            lightBgButton.FlatAppearance.BorderSize = 1;
+            lightBgButton.Click += (s, e) => ChooseBackground(true);
+            Button darkBgButton = new Button
+            {
+                Text = "暗色背景图",
+                Location = new System.Drawing.Point(200, 246),
+                Size = new System.Drawing.Size(150, 34),
+                FlatStyle = FlatStyle.Flat,
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+            };
+            darkBgButton.FlatAppearance.BorderSize = 1;
+            darkBgButton.Click += (s, e) => ChooseBackground(false);
+            Button clearBgButton = new Button
+            {
+                Text = "清除背景",
+                Location = new System.Drawing.Point(360, 246),
+                Size = new System.Drawing.Size(130, 34),
+                FlatStyle = FlatStyle.Flat,
+                Font = new System.Drawing.Font("Segoe UI", 11f),
+            };
+            clearBgButton.FlatAppearance.BorderSize = 1;
+            clearBgButton.Click += (s, e) => ClearBackground();
+
+            settingsPage.Controls.Add(heading);
+            settingsPage.Controls.Add(themeLabel);
+            settingsPage.Controls.Add(themeBox);
+            settingsPage.Controls.Add(zoomLabel);
+            settingsPage.Controls.Add(zoomBox);
+            settingsPage.Controls.Add(bgLabel);
+            settingsPage.Controls.Add(lightBgButton);
+            settingsPage.Controls.Add(darkBgButton);
+            settingsPage.Controls.Add(clearBgButton);
+
+            webHost.Controls.Add(settingsPage);
         }
 
-        private void NavigateTo(string url)
+        private void ChooseBackground(bool light)
         {
-            pendingUrl = url;
-            HighlightNav(url);
-            try
+            using (OpenFileDialog dlg = new OpenFileDialog())
             {
-                if (webView.CoreWebView2 != null)
+                dlg.Filter = "图片文件|*.png;*.jpg;*.jpeg;*.bmp;*.gif|所有文件|*.*";
+                dlg.Title = light ? "选择亮色背景图" : "选择暗色背景图";
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                try
                 {
-                    webView.CoreWebView2.Navigate(url);
+                    System.Drawing.Image img = System.Drawing.Image.FromFile(dlg.FileName);
+                    if (light)
+                    {
+                        if (backgroundLight != null) backgroundLight.Dispose();
+                        backgroundLight = img;
+                    }
+                    else
+                    {
+                        if (backgroundDark != null) backgroundDark.Dispose();
+                        backgroundDark = img;
+                    }
+                    SaveBackgroundPath(light, dlg.FileName);
+                    ApplyColorScheme();
+                }
+                catch (Exception ex)
+                {
+                    Launcher.ShowError("无法加载图片", ex.Message);
                 }
             }
-            catch
+        }
+
+        private void ClearBackground()
+        {
+            if (backgroundLight != null) { backgroundLight.Dispose(); backgroundLight = null; }
+            if (backgroundDark != null) { backgroundDark.Dispose(); backgroundDark = null; }
+            ClearBackgroundPath(true);
+            ClearBackgroundPath(false);
+            ApplyColorScheme();
+        }
+
+        private void ApplyZoom(double factor)
+        {
+            foreach (WebView2 v in views)
             {
-                // CoreWebView2 not ready yet; OnLoad navigates to pendingUrl once
-                // initialization completes.
+                try { if (v.CoreWebView2 != null) v.ZoomFactor = factor; } catch { }
             }
         }
 
-        private void HighlightNav(string url)
+        private bool HasBackground()
         {
-            ApplyNavState(harnessButton, url == HarnessUrl());
-            ApplyNavState(consoleButton, url == ConsoleUrl);
-            ApplyNavState(chatButton, url == ChatUrl);
-            ApplyNavState(githubButton, url == GitHubUrl);
+            return backgroundLight != null || backgroundDark != null;
         }
 
-        // Selected: blue fill + white text. Unselected: white fill + black text.
-        private static void ApplyNavState(RoundedButton button, bool selected)
+        private System.Drawing.Image CurrentBackground()
         {
-            button.Selected = selected;
+            bool dark = IsDarkMode();
+            return dark ? (backgroundDark ?? backgroundLight) : (backgroundLight ?? backgroundDark);
+        }
+
+        // 边框(标题栏 + 侧边栏)配色跟随当前模式;有壁纸时框架透明透出壁纸。
+        private void ApplyChromeColors()
+        {
+            bool dark = IsDarkMode();
+            System.Drawing.Color chromeBg = dark
+                ? System.Drawing.Color.FromArgb(0x1E, 0x1E, 0x1E)
+                : System.Drawing.Color.FromArgb(0xF3, 0xF3, 0xF3);
+            System.Drawing.Color chromeText = dark
+                ? System.Drawing.Color.White
+                : System.Drawing.Color.Black;
+
+            bool hasBg = HasBackground();
+            System.Drawing.Image bg = hasBg ? CurrentBackground() : null;
+
+            // 窗体背景:有壁纸时铺壁纸(左上角固定、不拉伸,窗口缩放只是裁剪/显露更多)
+            if (bg != null)
+            {
+                BackgroundImage = bg;
+                BackgroundImageLayout = ImageLayout.None;
+            }
+            else
+            {
+                BackgroundImage = null;
+            }
+
+            // 框架背景:有壁纸时透明(透出壁纸),否则纯色
+            System.Drawing.Color frameBg = bg != null ? System.Drawing.Color.Transparent : chromeBg;
+            // 框架文字:有壁纸时统一白色(通用),否则跟随主题
+            System.Drawing.Color frameText = bg != null ? System.Drawing.Color.White : chromeText;
+
+            if (titleBar != null) titleBar.BackColor = frameBg;
+            if (sidebar != null) sidebar.BackColor = frameBg;
+            if (webHost != null) webHost.BackColor = frameBg;
+            if (settingsPage != null)
+            {
+                settingsPage.BackColor = frameBg;
+                foreach (Control c in settingsPage.Controls)
+                {
+                    if (c is Label) c.ForeColor = frameText;
+                    if (c is Button)
+                    {
+                        Button btn = (Button)c;
+                        if (bg != null)
+                        {
+                            btn.BackColor = System.Drawing.Color.Transparent;
+                            btn.ForeColor = System.Drawing.Color.White;
+                            btn.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0x88, 0xFF, 0xFF, 0xFF);
+                        }
+                        else if (dark)
+                        {
+                            btn.BackColor = System.Drawing.Color.FromArgb(0x2A, 0x2A, 0x2A);
+                            btn.ForeColor = System.Drawing.Color.White;
+                            btn.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0x30, 0x36, 0x3D);
+                        }
+                        else
+                        {
+                            btn.BackColor = System.Drawing.Color.White;
+                            btn.ForeColor = System.Drawing.Color.Black;
+                            btn.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0xD0, 0xD7, 0xDE);
+                        }
+                    }
+                }
+            }
+            if (titleBar != null)
+            {
+                foreach (Control c in titleBar.Controls)
+                {
+                    if (c is Label) c.ForeColor = frameText;
+                    if (c is Button && c.Name != null
+                        && (c.Name.StartsWith("win", StringComparison.Ordinal) || c.Name == "collapse"))
+                        c.ForeColor = frameText;
+                }
+            }
+
+            // 恰好只设置一张背景图时,主题不可选(切换黑白无意义);无背景或两张时可选。
+            bool singleBackground = (backgroundLight != null) != (backgroundDark != null);
+            if (themeBox != null) themeBox.Enabled = !singleBackground;
+
+            HighlightNav(currentIndex);
+        }
+
+        // 边框颜色 + 所有 WebView 页面首选颜色方案一起切换(页面跟随深色/浅色)。
+        // 有壁纸时 WebView 背景透明,透出壁纸。
+        private void ApplyColorScheme()
+        {
+            ApplyChromeColors();
+            CoreWebView2PreferredColorScheme scheme;
+            if (colorMode == ColorMode.Dark) scheme = CoreWebView2PreferredColorScheme.Dark;
+            else if (colorMode == ColorMode.Light) scheme = CoreWebView2PreferredColorScheme.Light;
+            else scheme = CoreWebView2PreferredColorScheme.Auto;
+            foreach (WebView2 v in views)
+            {
+                try
+                {
+                    if (v.CoreWebView2 != null)
+                    {
+                        // WebView 一律不透明(harness 内容区不透明,只框架透壁纸),切换不闪烁
+                        v.DefaultBackgroundColor = IsDarkMode()
+                            ? System.Drawing.Color.FromArgb(0x1E, 0x1E, 0x1E)
+                            : System.Drawing.Color.White;
+                        v.CoreWebView2.Profile.PreferredColorScheme = scheme;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // 窗口控制按钮右对齐:跟随标题栏宽度变化重新定位。
+        private void LayoutTitleBar()
+        {
+            if (titleBar == null) return;
+            foreach (Control c in titleBar.Controls)
+            {
+                if (c is Button && c.Name != null && c.Name.StartsWith("win", StringComparison.Ordinal))
+                {
+                    int index = c.Name == "winClose" ? 1 : c.Name == "winMax" ? 2 : 3;
+                    c.Location = new System.Drawing.Point(titleBar.ClientSize.Width - 46 * index, 6);
+                }
+            }
+        }
+
+        private void OnTitleBarMouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (WindowState == FormWindowState.Maximized) return;
+            ReleaseCapture();
+            SendMessage(Handle, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
+        }
+
+        private void OnTitleBarDoubleClick(object sender, EventArgs e)
+        {
+            WindowState = WindowState == FormWindowState.Maximized
+                ? FormWindowState.Normal
+                : FormWindowState.Maximized;
+        }
+
+        private Button MakeWindowButton(string glyph, EventHandler onClick)
+        {
+            Button b = new Button
+            {
+                Text = glyph,
+                Size = new System.Drawing.Size(46, 32),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = System.Drawing.Color.Transparent,
+                ForeColor = System.Drawing.Color.White,
+                Font = new System.Drawing.Font("Segoe UI Symbol", 10f),
+                Cursor = Cursors.Default,
+            };
+            b.FlatAppearance.BorderSize = 0;
+            b.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(70, 255, 255, 255);
+            b.Click += onClick;
+            return b;
+        }
+
+        private void OnMinimizeClick(object sender, EventArgs e) { WindowState = FormWindowState.Minimized; }
+        private void OnMaximizeClick(object sender, EventArgs e)
+        {
+            WindowState = WindowState == FormWindowState.Maximized
+                ? FormWindowState.Normal
+                : FormWindowState.Maximized;
+        }
+        private void OnCloseClick(object sender, EventArgs e) { Close(); }
+        private void OnCollapseClick(object sender, EventArgs e)
+        {
+            if (sidebar != null) sidebar.Visible = !sidebar.Visible;
+        }
+
+        // 无边框窗口的 8px 边缘热区交给系统做 resize,保住调整窗口大小的能力。
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x0084) // WM_NCHITTEST
+            {
+                base.WndProc(ref m);
+                if ((int)m.Result == 0x01) // HTCLIENT
+                {
+                    System.Drawing.Point p = PointToClient(Cursor.Position);
+                    int w = ClientSize.Width;
+                    int h = ClientSize.Height;
+                    const int grip = 8;
+                    bool l = p.X < grip, r = p.X >= w - grip;
+                    bool t = p.Y < grip, b = p.Y >= h - grip;
+                    if (t && l) m.Result = (IntPtr)13;      // HTTOPLEFT
+                    else if (t && r) m.Result = (IntPtr)14; // HTTOPRIGHT
+                    else if (b && l) m.Result = (IntPtr)16; // HTBOTTOMLEFT
+                    else if (b && r) m.Result = (IntPtr)17; // HTBOTTOMRIGHT
+                    else if (t) m.Result = (IntPtr)12;      // HTTOP
+                    else if (b) m.Result = (IntPtr)15;      // HTBOTTOM
+                    else if (l) m.Result = (IntPtr)10;      // HTLEFT
+                    else if (r) m.Result = (IntPtr)11;      // HTRIGHT
+                }
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        private const int WM_NCLBUTTONDOWN = 0x00A1;
+        private const int HTCAPTION = 0x0002;
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+        private void OnNavClick(object sender, EventArgs e)
+        {
+            int index = (int)((Button)sender).Tag;
+            SwitchPage(index);
+        }
+
+        // 切换到指定页面:首次访问才加载,之后切换只是显示/隐藏,保留上次
+        // 浏览位置(尤其 GitHub 子页面多,切换不再刷新丢位置)。
+        // 页面索引:0=Harness 1=Platform 2=Chat 3=GitHub 4=设置。
+        private void SwitchPage(int index)
+        {
+            if (index < 0 || index > 4 || index == activeView) return;
+            if (index < 4 && !viewLoaded[index])
+            {
+                viewLoaded[index] = true;
+                try { views[index].CoreWebView2.Navigate(pageUrls[index]); } catch { }
+            }
+
+            if (index < 4)
+            {
+                // 切到 view:先显示新 view(覆盖旧),再隐藏旧,避免空白帧闪烁
+                views[index].Visible = true;
+                views[index].BringToFront();
+                if (activeView < 4) views[activeView].Visible = false;
+                else settingsPage.Visible = false;
+                webView = views[index];
+            }
+            else
+            {
+                // 切到设置页(纯 GDI):必须先隐藏 view(WebView 是 native 窗口会盖住 GDI)
+                if (activeView < 4) views[activeView].Visible = false;
+                settingsPage.Visible = true;
+                settingsPage.BringToFront();
+            }
+            activeView = index;
+            HighlightNav(index);
+        }
+
+        private void RefreshPage(int index)
+        {
+            if (index < 0 || index >= views.Length) return;
+            try
+            {
+                if (views[index].CoreWebView2 != null)
+                {
+                    views[index].CoreWebView2.Reload();
+                }
+            }
+            catch { }
+        }
+
+        private void HighlightNav(int index)
+        {
+            currentIndex = index;
+            ApplyNavState(harnessButton, index == 0);
+            ApplyNavState(consoleButton, index == 1);
+            ApplyNavState(chatButton, index == 2);
+            ApplyNavState(githubButton, index == 3);
+            ApplyNavState(settingsButton, index == 4);
+        }
+
+        // 参考 GitHub 亮暗主题:
+        //   亮色:未选白底黑字 + 浅灰边框;暗色:未选黑底白字 + 深灰边框;
+        //   选中(两主题一致):绿底白字 + 绿边框。
+        //   有壁纸时:未选透明(透出壁纸)+ 白字 + 半透明边框;选中仍绿底白字。
+        private void ApplyNavState(Button button, bool selected)
+        {
+            if (button == null) return;
+            bool dark = IsDarkMode();
+            bool hasBg = HasBackground();
+            System.Drawing.Color green = System.Drawing.Color.FromArgb(0x2D, 0xA4, 0x4E);
+            if (selected)
+            {
+                button.BackColor = green;
+                button.ForeColor = System.Drawing.Color.White;
+                button.FlatAppearance.BorderColor = green;
+            }
+            else if (hasBg)
+            {
+                button.BackColor = System.Drawing.Color.Transparent;
+                button.ForeColor = System.Drawing.Color.White;
+                button.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0x88, 0xFF, 0xFF, 0xFF);
+            }
+            else if (dark)
+            {
+                button.BackColor = System.Drawing.Color.FromArgb(0x0D, 0x11, 0x17);
+                button.ForeColor = System.Drawing.Color.White;
+                button.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0x30, 0x36, 0x3D);
+            }
+            else
+            {
+                button.BackColor = System.Drawing.Color.White;
+                button.ForeColor = System.Drawing.Color.Black;
+                button.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(0xD0, 0xD7, 0xDE);
+            }
         }
 
         private async void OnLoad(object sender, EventArgs e)
         {
             try
             {
+                // 无边框窗口最大化时只占工作区(不盖住任务栏)。
+                MaximizedBounds = Screen.FromHandle(Handle).WorkingArea;
+
                 // Detect a missing WebView2 Runtime up front and give the user a
                 // concrete install link instead of a generic failure.
                 string availableVersion = null;
@@ -905,17 +1527,21 @@ namespace DshDesktop
                 }
 
                 CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, webViewData, null);
-                await webView.EnsureCoreWebView2Async(env);
+                for (int i = 0; i < views.Length; i++)
+                {
+                    await views[i].EnsureCoreWebView2Async(env);
+                    views[i].CoreWebView2.NewWindowRequested += OnNewWindowRequested;
+                    views[i].CoreWebView2.NavigationStarting += OnNavigationStarting;
+                }
 
-                // Keep every target=_blank / window.open inside this one window:
-                // the harness, the DeepSeek console, and chat all stay in the
-                // same WebView2 (and share its cookies/localStorage, so console
-                // and chat logins persist) instead of opening a browser.
-                webView.CoreWebView2.NewWindowRequested += OnNewWindowRequested;
-                webView.CoreWebView2.NavigationStarting += OnNavigationStarting;
-
-                HighlightNav(pendingUrl);
-                webView.CoreWebView2.Navigate(pendingUrl);
+                // 只加载默认页 Harness;其余页首次切换时才加载。
+                activeView = 0;
+                webView = views[0];
+                viewLoaded[0] = true;
+                views[0].Visible = true;
+                HighlightNav(0);
+                ApplyColorScheme();
+                views[0].CoreWebView2.Navigate(pageUrls[0]);
             }
             catch (Exception ex)
             {
@@ -925,61 +1551,11 @@ namespace DshDesktop
             }
         }
 
-        // Right-click menu on the Harness button: a single "更新缩放率" action
-        // that re-matches the page to the current display's system scaling. The
-        // default is already 100% (ZoomFactor 1.0), which on a DPI-aware WebView2
-        // renders at the monitor's scale. After moving the window to another
-        // monitor or changing Windows scaling, this resets ZoomFactor to 1.0 so
-        // the page follows the new system scale.
-        private void BuildHarnessMenu()
-        {
-            harnessMenu = new ContextMenuStrip();
-            ToolStripMenuItem update = new ToolStripMenuItem("更新缩放率(匹配系统)");
-            update.Click += OnUpdateZoomClick;
-            harnessMenu.Items.Add(update);
-            harnessButton.ContextMenuStrip = harnessMenu;
-        }
-
-        private void OnUpdateZoomClick(object sender, EventArgs e)
-        {
-            double scale = DisplayScale();
-            try
-            {
-                if (webView.CoreWebView2 != null)
-                {
-                    webView.ZoomFactor = 1.0; // 100% = 跟随系统 DPI
-                }
-            }
-            catch
-            {
-                // CoreWebView2 not ready yet; ignore.
-            }
-            Launcher.Log("zoom updated: display scale " + scale.ToString("0.##") + ", ZoomFactor = 1.0 (follow system)");
-        }
-
-        // Current display scale of this window: 96 → 1.0, 120 → 1.25, 144 → 1.5.
-        private double DisplayScale()
-        {
-            try
-            {
-                uint dpi = GetDpiForWindow(Handle);
-                if (dpi >= 96) return dpi / 96.0;
-            }
-            catch
-            {
-                // Pre-Windows-10-1607 hosts lack GetDpiForWindow.
-            }
-            return 1.0;
-        }
-
-        [DllImport("user32.dll")]
-        private static extern uint GetDpiForWindow(IntPtr hwnd);
-
         private void OnNewWindowRequested(object sender, CoreWebView2NewWindowRequestedEventArgs e)
         {
             e.Handled = true;
             // External pop-ups open in the system browser; internal ones stay in
-            // this window (the harness opens its own UI in pop-ups).
+            // the active view (the harness opens its own UI in pop-ups).
             if (IsExternalUrl(e.Uri))
             {
                 try { Process.Start(e.Uri); } catch { }
@@ -987,8 +1563,7 @@ namespace DshDesktop
             }
             try
             {
-                webView.CoreWebView2.Navigate(e.Uri);
-                pendingUrl = e.Uri;
+                views[activeView].CoreWebView2.Navigate(e.Uri);
             }
             catch
             {
@@ -996,27 +1571,28 @@ namespace DshDesktop
             }
         }
 
-        // Intercept page-internal navigation: a link inside a Harness answer
-        // must not hijack this tab-less, back-less shell. External http(s) URLs
-        // open in the system browser; the Harness's own 127.0.0.1 URLs still
-        // navigate in place.
+        // Harness 视图保持"应用界面"干净:其内部点外部链接交给系统浏览器。
+        // Platform/Chat/GitHub 视图自由导航,保留这些站点的浏览状态(子页面切换不刷新)。
         private void OnNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
         {
-            if (navButtonNavigation)
+            if (sender == views[0].CoreWebView2)
             {
-                navButtonNavigation = false;
-                return;
-            }
-            if (IsExternalUrl(e.Uri))
-            {
-                e.Cancel = true;
-                try { Process.Start(e.Uri); } catch { }
+                if (IsExternalUrl(e.Uri))
+                {
+                    e.Cancel = true;
+                    try { Process.Start(e.Uri); } catch { }
+                }
             }
         }
 
         private bool IsExternalUrl(string uri)
         {
-            if (uri.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase)) return false;
+            // Only the launcher's own UI origin may navigate in place. The port
+            // suffix is anchored with the following slash so that 127.0.0.1 on
+            // any other port (e.g. 3082) is still treated as external.
+            string origin = "http://127.0.0.1:" + port + "/";
+            if (uri.Equals("http://127.0.0.1:" + port, StringComparison.OrdinalIgnoreCase)
+                || uri.StartsWith(origin, StringComparison.OrdinalIgnoreCase)) return false;
             return uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                 || uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
         }
@@ -1047,99 +1623,6 @@ namespace DshDesktop
             return null;
         }
 
-        /// <summary>
-        /// A nav button drawn as a rounded rectangle: white fill + black text by
-        /// default, blue fill + white text when selected, always with a thin
-        /// black border and centered text. Owner-drawn because the stock
-        /// WinForms Button cannot produce rounded corners.
-        /// </summary>
-        private sealed class RoundedButton : Button
-        {
-            private const int CornerRadius = 8;
-            private bool selected;
-
-            public RoundedButton()
-            {
-                FlatStyle = FlatStyle.Flat;
-                FlatAppearance.BorderSize = 0;
-                SetStyle(
-                    ControlStyles.UserPaint |
-                    ControlStyles.AllPaintingInWmPaint |
-                    ControlStyles.OptimizedDoubleBuffer |
-                    ControlStyles.ResizeRedraw,
-                    true);
-            }
-
-            /// <summary>Selected state: blue fill + white text when true.</summary>
-            public bool Selected
-            {
-                get { return selected; }
-                set
-                {
-                    if (selected == value) return;
-                    selected = value;
-                    Invalidate();
-                }
-            }
-
-            // Clip the control to its rounded outline: the four corners are not
-            // part of the control at all, so no rectangular frame can ever show
-            // there regardless of what the stock Button would paint.
-            protected override void OnResize(EventArgs e)
-            {
-                base.OnResize(e);
-                using (GraphicsPath path = RoundedRect(new System.Drawing.Rectangle(0, 0, Width, Height), CornerRadius))
-                {
-                    Region = new System.Drawing.Region(path);
-                }
-            }
-
-            // The rounded Region owns the shape; paint nothing here, leaving the
-            // corners (outside the Region) transparent to the nav bar behind.
-            protected override void OnPaintBackground(PaintEventArgs e)
-            {
-            }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                System.Drawing.Color fill = selected ? ActiveColor : System.Drawing.Color.White;
-                System.Drawing.Color text = selected ? System.Drawing.Color.White : System.Drawing.Color.Black;
-
-                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                // Inset by one pixel so the 1px border is not clipped at the edge.
-                using (GraphicsPath path = RoundedRect(new System.Drawing.Rectangle(0, 0, Width - 1, Height - 1), CornerRadius))
-                {
-                    using (System.Drawing.SolidBrush brush = new System.Drawing.SolidBrush(fill))
-                    {
-                        e.Graphics.FillPath(brush, path);
-                    }
-                    using (System.Drawing.Pen pen = new System.Drawing.Pen(System.Drawing.Color.Black, 1f))
-                    {
-                        e.Graphics.DrawPath(pen, path);
-                    }
-                }
-                TextRenderer.DrawText(
-                    e.Graphics,
-                    Text,
-                    Font,
-                    ClientRectangle,
-                    text,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-            }
-
-            /// <summary>Build a rounded-rectangle path for the given bounds.</summary>
-            private static GraphicsPath RoundedRect(System.Drawing.Rectangle rect, int radius)
-            {
-                int d = radius * 2;
-                GraphicsPath path = new GraphicsPath();
-                path.AddArc(rect.X, rect.Y, d, d, 180, 90);
-                path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
-                path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
-                path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
-                path.CloseFigure();
-                return path;
-            }
-        }
     }
 
     // 找不到 harness 时弹出的"请指定 bin.js 路径"对话框。

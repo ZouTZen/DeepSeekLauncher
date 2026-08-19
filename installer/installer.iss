@@ -2,7 +2,7 @@
 ; Build: ISCC.exe installer.iss  (produces setup.exe in this directory)
 
 #define MyAppName "DeepSeek Harness Launcher"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "DeepSeek"
 #define MyAppExeName "DshDesktop.exe"
 
