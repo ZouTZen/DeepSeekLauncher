@@ -31,27 +31,9 @@ DeepSeek Harness 的 Windows 桌面启动器。双击即可在单个无边框应
 
 ## 使用方式
 
-### 方式一:直接使用 dist(免安装,面向开发者)
+## 使用方式
 
-适合**已经部署了 harness** 的人。
-
-1. 下载 Release 里的 dist 压缩包(或自行 `build.ps1` 编译),解压得到 4 个文件:
-   - `DshDesktop.exe`
-   - `Microsoft.Web.WebView2.Core.dll`
-   - `Microsoft.Web.WebView2.WinForms.dll`
-   - `WebView2Loader.dll`
-2. 双击 `DshDesktop.exe`
-3. 首次打开按 Web GUI 提示配置 API Key
-
-前提:
-
-- 64 位 Windows
-- 已安装 node.js(启动器自动定位)
-- 已通过 **npx / npm 全局 / git clone** 任一方式安装 harness(启动器自动定位)
-
-`dist\` 放任意位置均可,启动器会自动查找 harness 的 CLI 入口。
-
-### 方式二:setup 安装(面向普通用户)
+### setup 安装(面向普通用户)
 
 适合**从零开始、想一键装好所有依赖**的人。
 
@@ -64,14 +46,15 @@ DeepSeek Harness 的 Windows 桌面启动器。双击即可在单个无边框应
 
 > 安装需要联网 + UAC 提权;卸载在「控制面板 → 程序和功能」,会连同 npm 全局 harness 一起卸载。
 
+> 开发者如需免安装运行,可用 `build.ps1` 自行编译到 `dist\`,双击 `dist\DshDesktop.exe` 即可(需已部署 harness)。
+
 ## Release 产物
 
 ### v1.1.0
 
 | 产物 | 说明 |
 |---|---|
-| `DeepSeekHarness-Setup.exe` | 安装包(推荐:自动装依赖 + 建快捷方式 + 卸载器) |
-| `DeepSeekLauncher-dist.zip` | 免安装版(exe + 3 DLL),手动解压使用 |
+| `DeepSeekHarness-Setup.exe` | 安装包(自动装依赖 + 建快捷方式 + 卸载器) |
 
 > 从 GitHub Releases 页面下载;`DeepSeekHarness-Setup.exe` 未签名,首次运行可能触发 SmartScreen 提示。
 
