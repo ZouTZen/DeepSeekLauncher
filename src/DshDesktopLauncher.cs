@@ -1229,6 +1229,8 @@ namespace DshDesktop
             {
                 BackgroundImage = null;
             }
+            // 边缘 6px resize 热区区域的底色跟随主题(有壁纸时会被壁纸覆盖)
+            BackColor = chromeBg;
 
             // 框架背景:有壁纸时透明(透出壁纸),否则纯色
             System.Drawing.Color frameBg = bg != null ? System.Drawing.Color.Transparent : chromeBg;
@@ -1372,10 +1374,24 @@ namespace DshDesktop
             if (sidebar != null) sidebar.Visible = !sidebar.Visible;
         }
 
-        // 无边框窗口的 8px 边缘热区交给系统做 resize,保住调整窗口大小的能力。
+        // 纯无边框(FormBorderStyle.None)。resize 由窗口边缘的 Form 区域
+        // (Padding) + WM_NCHITTEST 处理,不引入 WS_THICKFRAME 的系统边框。
+
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x0084) // WM_NCHITTEST
+            if (m.Msg == 0x0024) // WM_GETMINMAXINFO:最大化不盖任务栏,并补偿边框
+            {
+                MINMAXINFO mmi = (MINMAXINFO)Marshal.PtrToStructure(m.LParam, typeof(MINMAXINFO));
+                System.Drawing.Rectangle wa = Screen.FromHandle(Handle).WorkingArea;
+                mmi.ptMaxPosition.X = wa.Left;
+                mmi.ptMaxPosition.Y = wa.Top;
+                mmi.ptMaxSize.X = wa.Width;
+                mmi.ptMaxSize.Y = wa.Height;
+                Marshal.StructureToPtr(mmi, m.LParam, true);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == 0x0084) // WM_NCHITTEST:边缘热区(窗口四周 6px 是 Form 自己的区域)
             {
                 base.WndProc(ref m);
                 if ((int)m.Result == 0x01) // HTCLIENT
@@ -1402,11 +1418,37 @@ namespace DshDesktop
 
         private const int WM_NCLBUTTONDOWN = 0x00A1;
         private const int HTCAPTION = 0x0002;
+        private const int GWL_STYLE = -16;
+        private const int WS_THICKFRAME = 0x00040000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint { public int X; public int Y; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MINMAXINFO
+        {
+            public NativePoint ptReserved;
+            public NativePoint ptMaxSize;
+            public NativePoint ptMaxPosition;
+            public NativePoint ptMinTrackSize;
+            public NativePoint ptMaxTrackSize;
+        }
 
         [DllImport("user32.dll")]
         private static extern bool ReleaseCapture();
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOZORDER = 0x0004;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_FRAMECHANGED = 0x0020;
 
         private void OnNavClick(object sender, EventArgs e)
         {
@@ -1505,12 +1547,24 @@ namespace DshDesktop
             }
         }
 
+        // 边缘 6px 是 Form 自己的区域,鼠标在那里时 WM_NCHITTEST 到达主窗口,
+        // resize 热区才生效(WebView2 native 子窗口会吞掉其余区域的 hit test)。
+        // 最大化时去掉(Padding=0),内容完全铺满工作区。
+        private void UpdateEdgePadding()
+        {
+            Padding = WindowState == FormWindowState.Maximized ? new Padding(0) : new Padding(6);
+        }
+
         private async void OnLoad(object sender, EventArgs e)
         {
             try
             {
                 // 无边框窗口最大化时只占工作区(不盖住任务栏)。
                 MaximizedBounds = Screen.FromHandle(Handle).WorkingArea;
+
+                // 窗口四周留 6px Form 区域作为 resize 热区;最大化时去掉让内容铺满。
+                UpdateEdgePadding();
+                Resize += (s, args) => UpdateEdgePadding();
 
                 // Detect a missing WebView2 Runtime up front and give the user a
                 // concrete install link instead of a generic failure.
